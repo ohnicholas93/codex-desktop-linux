@@ -65,6 +65,7 @@ impl ChromeClientRouteError {
 struct HostState {
     stdout: Arc<Mutex<io::Stdout>>,
     rollout_tracker: RolloutTracker,
+    extension_id: Option<String>,
     clients: HashMap<usize, Client>,
     pending_chrome_requests: HashMap<String, PendingChromeRequest>,
     pending_client_requests: HashMap<String, PendingClientRequest>,
@@ -74,10 +75,15 @@ struct HostState {
 }
 
 impl HostState {
-    fn new(stdout: Arc<Mutex<io::Stdout>>, rollout_tracker: RolloutTracker) -> Self {
+    fn new(
+        stdout: Arc<Mutex<io::Stdout>>,
+        rollout_tracker: RolloutTracker,
+        extension_id: Option<String>,
+    ) -> Self {
         Self {
             stdout,
             rollout_tracker,
+            extension_id,
             clients: HashMap::new(),
             pending_chrome_requests: HashMap::new(),
             pending_client_requests: HashMap::new(),
@@ -305,7 +311,12 @@ fn main() -> Result<()> {
 
     let stdout = Arc::new(Mutex::new(io::stdout()));
     let rollout_tracker = RolloutTracker::new(Arc::clone(&stdout));
-    let state = Arc::new(Mutex::new(HostState::new(stdout, rollout_tracker)));
+    let extension_id = extension_id_from_args();
+    let state = Arc::new(Mutex::new(HostState::new(
+        stdout,
+        rollout_tracker,
+        extension_id,
+    )));
 
     log(&format!("listening on {}", socket_path.display()));
 
@@ -337,6 +348,19 @@ fn sessions_root() -> Option<PathBuf> {
     env::var_os("HOME")
         .map(PathBuf::from)
         .map(|home| home.join(".codex").join("sessions"))
+}
+
+fn extension_id_from_args() -> Option<String> {
+    env::args().skip(1).find_map(|arg| {
+        arg.strip_prefix("chrome-extension://")
+            .and_then(|value| value.split('/').next())
+            .filter(|value| is_extension_id(value))
+            .map(ToString::to_string)
+    })
+}
+
+fn is_extension_id(value: &str) -> bool {
+    value.len() == 32 && value.bytes().all(|byte| matches!(byte, b'a'..=b'p'))
 }
 
 fn socket_path(socket_dir: &Path) -> PathBuf {
@@ -558,6 +582,18 @@ fn handle_client_message(state: &SharedState, client_id: usize, message: Value) 
         return;
     }
 
+    if message.get("method").and_then(Value::as_str) == Some("getInfo") {
+        let Some(id) = message.get("id").cloned() else {
+            return;
+        };
+        let state = state.lock().expect("host state mutex poisoned");
+        state.send_client(
+            client_id,
+            &extension_info_response(id, state.extension_id.as_deref()),
+        );
+        return;
+    }
+
     let Some(client_request_id) = message.get("id").cloned() else {
         return;
     };
@@ -576,6 +612,35 @@ fn handle_client_message(state: &SharedState, client_id: usize, message: Value) 
         },
     );
     state.send_chrome(&with_id(message, Value::String(chrome_id)));
+}
+
+fn extension_info_response(id: Value, extension_id: Option<&str>) -> Value {
+    let mut metadata = serde_json::Map::new();
+    if let Some(extension_id) = extension_id {
+        metadata.insert(
+            "extensionId".to_string(),
+            Value::String(extension_id.to_string()),
+        );
+    }
+
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "name": "Chrome",
+            "version": "unknown",
+            "type": "extension",
+            "capabilities": {
+                "tab": [
+                    {
+                        "id": "pageAssets",
+                        "description": "List assets already observed in the current page state and bundle selected assets into a temporary local artifact."
+                    }
+                ]
+            },
+            "metadata": Value::Object(metadata)
+        }
+    })
 }
 
 fn handle_chrome_message(state: &SharedState, message: Value) {
@@ -995,6 +1060,59 @@ mod tests {
     }
 
     #[test]
+    fn get_info_is_answered_by_host_for_extension_discovery() {
+        let stdout = Arc::new(Mutex::new(io::stdout()));
+        let (client_writer, mut client_reader) = UnixStream::pair().unwrap();
+        let state = Arc::new(Mutex::new(HostState::new(
+            Arc::clone(&stdout),
+            RolloutTracker {
+                inner: Arc::new(Mutex::new(RolloutTrackerState {
+                    observed: HashMap::new(),
+                })),
+                stdout,
+                sessions_root: None,
+            },
+            Some("abcdefghijklmnopabcdefghijklmnop".to_string()),
+        )));
+
+        {
+            let mut state = state.lock().unwrap();
+            state.clients.insert(
+                1,
+                Client {
+                    writer: Arc::new(Mutex::new(client_writer)),
+                },
+            );
+        }
+
+        handle_client_message(
+            &state,
+            1,
+            json!({
+                "jsonrpc": "2.0",
+                "id": "info-1",
+                "method": "getInfo",
+                "params": {
+                    "session_id": "session-1",
+                    "turn_id": "turn-1"
+                }
+            }),
+        );
+
+        let message = read_frame(&mut client_reader).unwrap().unwrap();
+        assert_eq!(message["id"], "info-1");
+        assert_eq!(message["result"]["type"], "extension");
+        assert_eq!(
+            message["result"]["metadata"]["extensionId"],
+            "abcdefghijklmnopabcdefghijklmnop"
+        );
+
+        let state = state.lock().unwrap();
+        assert!(state.pending_chrome_requests.is_empty());
+        assert_eq!(state.next_chrome_id, 1);
+    }
+
+    #[test]
     fn disconnect_cleanup_removes_pending_state_for_client() {
         let mut pending_chrome = HashMap::from([
             (
@@ -1055,6 +1173,7 @@ mod tests {
                 stdout,
                 sessions_root: None,
             },
+            None,
         )
     }
 
